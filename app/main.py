@@ -1,67 +1,77 @@
-from fastapi import FastAPI, UploadFile, WebSocket, WebSocketDisconnect, BackgroundTasks
-from sqlalchemy.orm import Session
-from app.database import SessionLocal
-from app.models import Expense
-import pandas as pd
-import httpx
-import asyncio
+from contextlib import asynccontextmanager
+import time
+from typing import Optional
+from fastapi import FastAPI
+from pydantic import BaseModel
+import os
+import psycopg
+from psycopg.rows import dict_row
+from app.utility.cache import load_cache
+from .routes import expenses
+from . import models
+from .database import engine
+import logging
+from dotenv import load_dotenv
+from .config import settings
 
-app = FastAPI()
-active_connections = []
+load_dotenv()
 
-@app.websocket("/ws/progress")
-async def websocket_endpoint(websocket: WebSocket):
-    await websocket.accept()
-    active_connections.append(websocket)
-    try:
-        while True:
-            await websocket.receive_text()
-    except WebSocketDisconnect:
-        active_connections.remove(websocket)
+logging.basicConfig(level=logging.ERROR)
 
-async def send_progress(message: str):
-    for connection in active_connections:
-        await connection.send_text(message)
+models.Base.metadata.create_all(bind=engine)
 
-async def get_category(description: str) -> str:
-    prompt = f'Categorize the following expense: "{description}"\nCategory:'
-    try:
-        async with httpx.AsyncClient() as client:
-            response = await client.post("http://localhost:11434/api/generate", json={
-                "model": "codellama:instruct",
-                "prompt": prompt,
-                "stream": False
-            })
-            return response.json().get('response', '').strip() or "Uncategorized"
-    except Exception:
-        return "Uncategorized"
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    dbConnectAttempts = 5
+    DB_PW = os.getenv("db_iom_password")
+    DB_USER = os.getenv("db_iom_user")
 
-async def process_expenses(df: pd.DataFrame):
-    db: Session = SessionLocal()
-    for i, row in df.iterrows():
-        category = await get_category(row['Description'])
-        await send_progress(f"[{i+1}/{len(df)}] {row['Description']} → {category}")
-        expense = Expense(description=row['Description'], amount=row['Amount'], category=category)
-        db.add(expense)
-    db.commit()
-    db.close()
-    await send_progress("✅ All expenses processed.")
+    print(f"DB_USER: {DB_USER}, DB_PW: {DB_PW}")
 
-@app.post("/upload-expenses/")
-async def upload_expenses(file: UploadFile, background_tasks: BackgroundTasks):
-    df = pd.read_csv(file.file)
-    background_tasks.add_task(process_expenses, df)
-    return {"message": "Upload received. Processing in background."}
+    while dbConnectAttempts > 0:
+        try:
+            conn = psycopg.connect(host=settings.DB_SERVER, dbname=settings.DB_IOM_DATABASE,
+                                user=DB_USER, password=DB_PW, row_factory=dict_row)
+            cursor = conn.cursor()
+            logging.info("Database connection successful")
+            break
+        except Exception as error:
+            print("Connecting to DB failed")
+            print("Error: ", error)
+            dbConnectAttempts -= 1
+            time.sleep(3)
 
-@app.get("/expenses")
-def get_expenses():
-    db: Session = SessionLocal()
-    expenses = db.query(Expense).all()
-    db.close()
-    return [
-        {
-            "description": e.description,
-            "amount": e.amount,
-            "category": e.category
-        } for e in expenses
-    ]
+    load_cache()  # Call your cache loader here
+    yield
+
+app = FastAPI(lifespan=lifespan)
+
+#Routes
+app.include_router(expenses.router)
+
+
+class Post(BaseModel):
+    name: str
+    price: float
+    sale: Optional[bool] = False
+    inventory: Optional[int] = 0
+
+
+
+
+
+# active_connections = []
+
+# @app.websocket("/ws/progress")
+# async def websocket_endpoint(websocket: WebSocket):
+#     await websocket.accept()
+#     active_connections.append(websocket)
+#     try:
+#         while True:
+#             await websocket.receive_text()
+#     except WebSocketDisconnect:
+#         active_connections.remove(websocket)
+
+
+
+
